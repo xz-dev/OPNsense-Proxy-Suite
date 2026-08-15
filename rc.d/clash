@@ -12,9 +12,11 @@ log_file="/var/log/clash.log"
 
 command=/usr/sbin/daemon
 command_args="-P /var/run/clash.pid /usr/local/bin/clash -d /usr/local/etc/clash/ >>$log_file"
+proxy_bypass_script=/usr/local/etc/clash/scripts/mihomo_proxy_bypass.py
 
 pidfile=/var/run/${name}.pid
 
+start_postcmd=clash_proxy_bypass
 status_cmd=clash_status
 
 
@@ -23,6 +25,14 @@ status_cmd=clash_status
 
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> $log_file
+}
+
+clash_proxy_bypass()
+{
+    if [ -x "$proxy_bypass_script" ]; then
+        "$proxy_bypass_script" >> "$log_file" 2>&1 &
+    fi
+    return 0
 }
 
 clash_status()

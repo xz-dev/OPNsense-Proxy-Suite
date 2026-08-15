@@ -34,7 +34,7 @@ log() {
 
 # 创建目录
 log "$YELLOW" "创建目录..."
-mkdir -p "$CONF_DIR/sing-box" "$CONF_DIR/clash" "$CONF_DIR/clash/sub" "$CONF_DIR/clash/ui" "$CONF_DIR/tun2socks" "$CONF_DIR/mosdns" "$CONF_DIR/mosdns/rule" || log "$RED" "目录创建失败！"
+mkdir -p "$CONF_DIR/sing-box" "$CONF_DIR/clash" "$CONF_DIR/clash/sub" "$CONF_DIR/clash/ui" "$CONF_DIR/clash/scripts" "$CONF_DIR/tun2socks" "$CONF_DIR/mosdns" "$CONF_DIR/mosdns/rule" || log "$RED" "目录创建失败！"
 
 # 复制文件
 log "$YELLOW" "复制文件..."
@@ -49,6 +49,7 @@ cp -f plugins/* "$PLUGINS/" || log "$RED" "plugins 文件复制失败！"
 cp -f actions/* "$ACTIONS/" || log "$RED" "actions 文件复制失败！"
 cp -R menu/* "$MODELS_DIR/" || log "$RED" "menu 文件复制失败！"
 cp rc.d/* "$RC_DIR/" || log "$RED" "rc.d 文件复制失败！"
+cp scripts/* "$CONF_DIR/clash/scripts/" || log "$RED" "scripts 文件复制失败！"
 cp geo/* "$CONF_DIR/mosdns/" || log "$RED" "geo 文件复制失败！"
 cp geo/* "$CONF_DIR/clash/" || log "$RED" "geo 文件复制失败！"
 cp conf/config_mosdns.yaml "$CONF_DIR/mosdns/config.yaml" || log "$RED" "mosdns 配置文件复制失败！"
@@ -96,6 +97,7 @@ for service in clash mosdns tun2socks; do
     chmod +x "$BIN_DIR/$service"
     chmod +x "$RC_DIR/$service"
 	chmod +x /usr/bin/sub
+	chmod +x "$CONF_DIR/clash/scripts/mihomo_proxy_bypass.py"
 	chmod +x /usr/local/etc/rc.d/singbox
 	chmod +x /usr/local/bin/sing-box
 	chmod +x $SYS_HOOK_EARLY/11-tun2socks
