@@ -15,6 +15,8 @@ from pathlib import Path
 
 BLOCK_BEGIN = "# BEGIN OPNsense Proxy Endpoint DIRECT"
 BLOCK_END = "# END OPNsense Proxy Endpoint DIRECT"
+SNIFFER_BLOCK_BEGIN = "# BEGIN OPNsense Proxy Endpoint SNIFFER BYPASS"
+SNIFFER_BLOCK_END = "# END OPNsense Proxy Endpoint SNIFFER BYPASS"
 DEFAULT_CONFIG = Path("/usr/local/etc/clash/config.yaml")
 
 
@@ -268,6 +270,272 @@ def inject_direct_rules(yaml: str, servers) -> str:
     return yaml
 
 
+def endpoint_cidrs(endpoints):
+    cidrs = set()
+    for endpoint in endpoints:
+        try:
+            address = ipaddress.ip_address(endpoint)
+        except ValueError:
+            continue
+        cidrs.add(f"{address.compressed}/{address.max_prefixlen}")
+    return cidrs
+
+
+def split_flow_items(value: str):
+    items = []
+    start = 0
+    depth = 0
+    quote = None
+    escaped = False
+    for index, character in enumerate(value):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote == '"':
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+        elif character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+        elif character == "," and depth == 0:
+            items.append(value[start:index].strip())
+            start = index + 1
+    if quote or depth:
+        raise ValueError("unterminated inline YAML collection")
+    tail = value[start:].strip()
+    if tail:
+        items.append(tail)
+    return items
+
+
+def split_flow_mapping_item(item: str):
+    quote = None
+    escaped = False
+    depth = 0
+    for index, character in enumerate(item):
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote == '"':
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+        elif character in "[{":
+            depth += 1
+        elif character in "]}":
+            depth -= 1
+        elif character == ":" and depth == 0:
+            return item[:index].strip(), item[index + 1 :].strip()
+    raise ValueError("inline YAML mapping item has no key separator")
+
+
+def flow_collection_end(value: str, start: int) -> int:
+    pairs = {"{": "}", "[": "]"}
+    stack = []
+    quote = None
+    escaped = False
+    for index in range(start, len(value)):
+        character = value[index]
+        if quote:
+            if escaped:
+                escaped = False
+            elif character == "\\" and quote == '"':
+                escaped = True
+            elif character == quote:
+                quote = None
+            continue
+        if character in "'\"":
+            quote = character
+        elif character in pairs:
+            stack.append(pairs[character])
+        elif character in "}]":
+            if not stack or stack.pop() != character:
+                raise ValueError("mismatched inline YAML collection")
+            if not stack:
+                return index
+    raise ValueError("unterminated inline YAML collection")
+
+
+YAML_METADATA_PATTERN = (
+    r"(?:(?:&[A-Za-z0-9_.-]+|!![A-Za-z0-9_.-]+|![A-Za-z0-9_.-]+|!<[^>\r\n]+>)"
+    r"[ \t]*)*"
+)
+YAML_METADATA = re.compile(YAML_METADATA_PATTERN)
+
+
+def normalize_inline_sniffer(yaml: str, eol: str) -> str:
+    match = re.search(
+        rf"(?m)^sniffer:[ \t]*(?P<metadata>{YAML_METADATA_PATTERN})(?P<brace>\{{)",
+        yaml,
+    )
+    if not match:
+        return yaml
+    start = match.start("brace")
+    end = flow_collection_end(yaml, start)
+    line_break = yaml.find("\n", end)
+    if line_break < 0:
+        replace_end = len(yaml)
+        tail = yaml[end + 1 :].rstrip("\r")
+        trailing_eol = ""
+    else:
+        replace_end = line_break + 1
+        tail = yaml[end + 1 : line_break].rstrip("\r")
+        trailing_eol = eol
+    if not re.fullmatch(r"[ \t]*(?:#.*)?", tail):
+        raise ValueError("unsupported content after inline sniffer mapping")
+    metadata = match.group("metadata").strip()
+    comment = tail.strip()
+    header_suffix = "".join(
+        part
+        for part in (
+            f" {metadata}" if metadata else "",
+            f" {comment}" if comment else "",
+        )
+    )
+    lines = [f"sniffer:{header_suffix}"]
+    for item in split_flow_items(yaml[start + 1 : end]):
+        key, value = split_flow_mapping_item(item)
+        lines.append(f"  {key}: {value}")
+    replacement = eol.join(lines) + trailing_eol
+    return yaml[: match.start()] + replacement + yaml[replace_end:]
+
+
+def parse_inline_list(value: str):
+    value = value.strip()
+    bracket = value.find("[")
+    if bracket < 0:
+        raise ValueError("skip-dst-address must be a YAML list")
+    prefix = value[:bracket].strip()
+    if not YAML_METADATA.fullmatch(prefix):
+        raise ValueError("unsupported skip-dst-address YAML metadata")
+    end = flow_collection_end(value, bracket)
+    if value[end + 1 :].strip():
+        raise ValueError("unsupported content after skip-dst-address list")
+    return prefix, split_flow_items(value[bracket + 1 : end])
+
+
+def is_yaml_metadata(value: str) -> bool:
+    return bool(value and YAML_METADATA.fullmatch(value.strip()))
+
+
+def generated_sniffer_block(item_indent: str, cidrs, eol: str) -> str:
+    return (
+        eol.join(
+            [
+                f"{item_indent}{SNIFFER_BLOCK_BEGIN}",
+                *(f"{item_indent}- {cidr}" for cidr in sorted(cidrs)),
+                f"{item_indent}{SNIFFER_BLOCK_END}",
+            ]
+        )
+        + eol
+    )
+
+
+def strip_generated_sniffer_block(section: str, item_indent: str) -> str:
+    pattern = re.compile(
+        rf"(?m)^{re.escape(item_indent)}{re.escape(SNIFFER_BLOCK_BEGIN)}\r?\n"
+        rf"(?P<body>(?:^{re.escape(item_indent)}- [^\r\n]+\r?\n)*)"
+        rf"^{re.escape(item_indent)}{re.escape(SNIFFER_BLOCK_END)}\r?\n?"
+    )
+
+    def remove(match):
+        values = [
+            line[len(item_indent) + 2 :].strip()
+            for line in match.group("body").splitlines()
+        ]
+        if not values or any(
+            not re.fullmatch(r"(?:[^\s]+)/(?:32|128)", value) for value in values
+        ):
+            return match.group(0)
+        return ""
+
+    return pattern.sub(remove, section)
+
+
+def inject_sniffer_skip_dst(yaml: str, endpoints) -> str:
+    cidrs = endpoint_cidrs(endpoints)
+    if not cidrs:
+        return yaml
+
+    eol = "\r\n" if "\r\n" in yaml else "\n"
+    yaml = normalize_inline_sniffer(yaml, eol)
+    header = re.search(
+        r"(?m)^sniffer:[ \t]*(?P<value>[^#\r\n]*?)"
+        r"(?P<comment>[ \t]+#.*)?(?P<eol>\r?\n|$)",
+        yaml,
+    )
+    if not header:
+        return yaml
+    header_value = header.group("value").strip()
+    if header_value.lower() in {"null", "~"}:
+        return yaml
+    if header_value and not is_yaml_metadata(header_value):
+        raise ValueError("unsupported top-level sniffer YAML value")
+
+    section_end = re.search(r"(?m)^[A-Za-z0-9_-]+[ \t]*:", yaml[header.end() :])
+    end = header.end() + section_end.start() if section_end else len(yaml)
+    section = yaml[header.end() : end]
+    child_indent = "  "
+    first_child = re.search(r"(?m)^([ \t]+)[^ #\r\n]", section)
+    if first_child:
+        child_indent = first_child.group(1)
+    item_indent = child_indent + "  "
+
+    field_pattern = re.compile(
+        rf"(?m)^{re.escape(child_indent)}skip-dst-address:[ \t]*"
+        r"(?P<value>[^#\r\n]*?)(?P<comment>[ \t]+#.*)?(?P<eol>\r?\n|$)"
+    )
+    field = field_pattern.search(section)
+    if field:
+        value = field.group("value").strip()
+        if value and not is_yaml_metadata(value):
+            metadata, user_items = parse_inline_list(value)
+            metadata = f" {metadata}" if metadata else ""
+            comment = field.group("comment") or ""
+            replacement = (
+                f"{child_indent}skip-dst-address:{metadata}{comment}{eol}"
+                + "".join(f"{item_indent}- {item}{eol}" for item in user_items)
+            )
+            section = section[: field.start()] + replacement + section[field.end() :]
+            field = field_pattern.search(section)
+        section_had_final_eol = section.endswith(("\n", "\r"))
+        value_start = field.end()
+        value_end_match = re.search(
+            rf"(?m)^(?:[ \t]{{0,{len(child_indent)}}})[^ #\r\n]", section[value_start:]
+        )
+        value_end = (
+            value_start + value_end_match.start() if value_end_match else len(section)
+        )
+        prefix = section[:value_start]
+        if not field.group("eol"):
+            prefix += eol
+        original_values = section[value_start:value_end]
+        values = strip_generated_sniffer_block(original_values, item_indent)
+        block = generated_sniffer_block(item_indent, cidrs, eol)
+        if value_end == len(section) and not section_had_final_eol:
+            block = block.rstrip("\r\n")
+        section = prefix + block + values + section[value_end:]
+    else:
+        prefix = "" if not section or section.endswith(("\n", "\r")) else eol
+        section += (
+            prefix
+            + f"{child_indent}skip-dst-address:{eol}"
+            + generated_sniffer_block(item_indent, cidrs, eol).rstrip("\r\n")
+        )
+        if end < len(yaml):
+            section += eol
+
+    return yaml[: header.end()] + section + yaml[end:]
+
+
 def wait_for_runtime(base_url: str, secret: str, expected_providers=frozenset()):
     last_error = "API not ready"
     deadline = time.monotonic() + 10
@@ -359,8 +627,10 @@ def sync(
         except ValueError:
             endpoints.update(resolved_addresses(base_url, secret, server))
     # Official Mihomo has no writable /rules route. PUT /configs is its supported
-    # API for atomically applying a complete config with generated rules first.
+    # API for atomically applying a complete config with generated endpoint
+    # rules and matching sniffer exclusions.
     runtime_yaml = inject_direct_rules(yaml, endpoints)
+    runtime_yaml = inject_sniffer_skip_dst(runtime_yaml, endpoints)
     status, _ = api_request(
         base_url, secret, "PUT", "/configs?force=true", {"payload": runtime_yaml}
     )
@@ -380,6 +650,11 @@ proxies:
 dns:
   nameserver:
     - https://dns.example.com/dns-query
+sniffer:
+  enable: true
+  override-destination: true
+  skip-dst-address:
+    - 192.0.2.99/32
 rules:
   - MATCH,PROXY
 """
@@ -396,6 +671,128 @@ rules:
         for rule in expected
     )
     assert result.count(BLOCK_BEGIN) == result.count(BLOCK_END) == 1
+    result = inject_sniffer_skip_dst(result, servers)
+    assert "    - 192.0.2.4/32" in result
+    assert "    - 2001:db8::1/128" in result
+    assert "    - 192.0.2.99/32" in result
+    assert "node.example.com" not in top_level_section(result, "sniffer")
+    assert result.count(SNIFFER_BLOCK_BEGIN) == 1
+    assert inject_sniffer_skip_dst(result, servers) == result
+
+    no_sniffer = "rules:\n  - MATCH,PROXY\n"
+    assert inject_sniffer_skip_dst(no_sniffer, {"192.0.2.4"}) == no_sniffer
+    empty_skip = inject_sniffer_skip_dst(
+        "sniffer:\n  enable: true\n  skip-dst-address: []\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    assert empty_skip.index("  skip-dst-address:") < empty_skip.index(
+        "    - 192.0.2.4/32"
+    )
+
+    eof = inject_sniffer_skip_dst("sniffer:\n  enable: true", {"192.0.2.4"})
+    assert "enable: true\n  skip-dst-address:" in eof
+    assert inject_sniffer_skip_dst(eof, {"192.0.2.4"}) == eof
+    eof_field = inject_sniffer_skip_dst(
+        "sniffer:\n  enable: true\n  skip-dst-address:", {"192.0.2.4"}
+    )
+    assert inject_sniffer_skip_dst(eof_field, {"192.0.2.4"}) == eof_field
+
+    crlf = "sniffer:\r\n  enable: true\r\n  skip-dst-address:\r\n    - 203.0.113.7/32\r\nrules: []\r\n"
+    crlf_result = inject_sniffer_skip_dst(crlf, {"192.0.2.4"})
+    assert "\r\n" in crlf_result and "\n" not in crlf_result.replace("\r\n", "")
+    assert inject_sniffer_skip_dst(crlf_result, {"192.0.2.4"}) == crlf_result
+
+    inline_list = inject_sniffer_skip_dst(
+        "sniffer:\n  enable: true\n  skip-dst-address: [203.0.113.7/32, '2001:db8::7/128']\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    assert "    - 203.0.113.7/32" in inline_list
+    assert "    - '2001:db8::7/128'" in inline_list
+    assert "    - 192.0.2.4/32" in inline_list
+
+    inline_sniffer = inject_sniffer_skip_dst(
+        "sniffer: {enable: true, sniff: {TLS: {ports: [443, 8443]}}, skip-domain: ['a,b']}\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    assert "  sniff: {TLS: {ports: [443, 8443]}}" in inline_sniffer
+    assert "  skip-domain: ['a,b']" in inline_sniffer
+    assert "    - 192.0.2.4/32" in inline_sniffer
+
+    multiline_sniffer = inject_sniffer_skip_dst(
+        'sniffer: {enable: true,\n  skip-domain: ["a,b", "x:y"],\n  skip-dst-address: [203.0.113.7/32]}\nrules: []\n',
+        {"192.0.2.4"},
+    )
+    assert '  skip-domain: ["a,b", "x:y"]' in multiline_sniffer
+    assert "    - 203.0.113.7/32" in multiline_sniffer
+    assert "    - 192.0.2.4/32" in multiline_sniffer
+    assert (
+        inject_sniffer_skip_dst(multiline_sniffer, {"192.0.2.4"}) == multiline_sniffer
+    )
+
+    anchored = inject_sniffer_skip_dst(
+        "sniffer:\n  skip-dst-address: &skip [203.0.113.7/32]\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    tagged = inject_sniffer_skip_dst(
+        "sniffer:\n  skip-dst-address: !!seq [203.0.113.8/32]\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    assert "  skip-dst-address: &skip\n" in anchored
+    assert "    - 203.0.113.7/32" in anchored
+    assert "  skip-dst-address: !!seq\n" in tagged
+    assert "    - 203.0.113.8/32" in tagged
+
+    inline_crlf = inject_sniffer_skip_dst(
+        "sniffer:\r\n  skip-dst-address: [203.0.113.7/32]\r\nrules: []\r\n",
+        {"192.0.2.4"},
+    )
+    assert "\n" not in inline_crlf.replace("\r\n", "")
+    assert inject_sniffer_skip_dst(inline_crlf, {"192.0.2.4"}) == inline_crlf
+
+    metadata_sniffer = inject_sniffer_skip_dst(
+        "sniffer: &sniff {enable: true, skip-domain: [example.com]} # retained\nrules: []\n",
+        {"192.0.2.4"},
+    )
+    assert "sniffer: &sniff # retained\n" in metadata_sniffer
+    assert "    - 192.0.2.4/32" in metadata_sniffer
+    assert inject_sniffer_skip_dst(metadata_sniffer, {"192.0.2.4"}) == metadata_sniffer
+    null_sniffer = "sniffer: null\nrules: []\n"
+    assert inject_sniffer_skip_dst(null_sniffer, {"192.0.2.4"}) == null_sniffer
+    try:
+        inject_sniffer_skip_dst("sniffer: *shared\nrules: []\n", {"192.0.2.4"})
+    except ValueError as error:
+        assert "unsupported top-level sniffer" in str(error)
+    else:
+        raise AssertionError("unsupported sniffer alias was silently accepted")
+
+    collision = f"notes:\n  {SNIFFER_BLOCK_BEGIN}\n  keep me\n  {SNIFFER_BLOCK_END}\nsniffer:\n  enable: true\n"
+    collision_result = inject_sniffer_skip_dst(collision, {"192.0.2.4"})
+    assert (
+        f"  {SNIFFER_BLOCK_BEGIN}\n  keep me\n  {SNIFFER_BLOCK_END}" in collision_result
+    )
+    assert collision_result.count(SNIFFER_BLOCK_BEGIN) == 2
+
+    try:
+        import yaml as yaml_parser
+    except ImportError:
+        yaml_parser = None
+    if yaml_parser:
+        for document in (
+            eof,
+            eof_field,
+            crlf_result,
+            inline_list,
+            inline_sniffer,
+            multiline_sniffer,
+            anchored,
+            tagged,
+            inline_crlf,
+            metadata_sniffer,
+            null_sniffer,
+            collision_result,
+        ):
+            yaml_parser.safe_load(document)
+
     null_rules = inject_direct_rules("rules: ~\n", {"192.0.2.4"})
     assert "IP-CIDR,192.0.2.4/32,DIRECT,no-resolve" in null_rules
     indentless = inject_direct_rules("rules:\n- MATCH,PROXY\n", {"proxy.example"})
@@ -527,6 +924,9 @@ rules: null
     )
     assert "IP-CIDR,198.51.100.7/32,DIRECT,no-resolve" in payload
     assert "IP-CIDR6,2001:db8::7/128,DIRECT,no-resolve" in payload
+    assert "    - 198.51.100.7/32" in payload
+    assert "    - 2001:db8::7/128" in payload
+    assert payload.count(SNIFFER_BLOCK_BEGIN) == 1
     print("self-test: ok")
 
 
