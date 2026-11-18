@@ -1,7 +1,9 @@
 #!/usr/local/bin/python3
 
 import argparse
+import contextlib
 import hashlib
+import io
 import ipaddress
 import json
 import re
@@ -536,54 +538,23 @@ def inject_sniffer_skip_dst(yaml: str, endpoints) -> str:
     return yaml[: header.end()] + section + yaml[end:]
 
 
-def wait_for_runtime(base_url: str, secret: str, expected_providers=frozenset()):
-    last_error = "API not ready"
-    deadline = time.monotonic() + 10
-    while True:
-        try:
-            status, response = api_request(base_url, secret, "GET", "/proxies")
-            if status == 200:
-                proxies = json.loads(response).get("proxies")
-                if isinstance(proxies, dict):
-                    provider_status, provider_response = api_request(
-                        base_url, secret, "GET", "/providers/proxies"
-                    )
-                    if provider_status == 200:
-                        providers = json.loads(provider_response).get("providers")
-                        if (
-                            isinstance(providers, dict)
-                            and expected_providers <= providers.keys()
-                        ):
-                            return proxies, providers
-                        last_error = "proxy providers not ready"
-                    else:
-                        last_error = (
-                            f"/providers/proxies returned HTTP {provider_status}"
-                        )
-                        if provider_status in {401, 403}:
-                            break
-                else:
-                    last_error = "invalid /proxies response"
-            else:
-                last_error = f"/proxies returned HTTP {status}"
-                if status in {401, 403}:
-                    break
-        except (OSError, ValueError, json.JSONDecodeError) as error:
-            last_error = str(error)
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(0.25)
-    raise RuntimeError(last_error)
+def fetch_runtime(base_url: str, secret: str):
+    status, response = api_request(base_url, secret, "GET", "/proxies")
+    if status != 200:
+        raise RuntimeError(f"/proxies returned HTTP {status}")
+    proxies = json.loads(response).get("proxies")
+    status, response = api_request(base_url, secret, "GET", "/providers/proxies")
+    if status != 200:
+        raise RuntimeError(f"/providers/proxies returned HTTP {status}")
+    providers = json.loads(response).get("providers")
+    if not isinstance(proxies, dict) or not isinstance(providers, dict):
+        raise TypeError("invalid Mihomo API response")
+    return proxies, providers
 
 
-def sync(
-    config_path: Path = DEFAULT_CONFIG, base_url: str | None = None
-) -> tuple[int, int]:
-    yaml = config_path.read_text()
-    base_url = base_url or api_base_url(yaml)
-    secret = yaml_scalar(yaml, "secret")
+def active_endpoints(yaml: str, config_path: Path, base_url: str, secret: str):
     providers = provider_configs(yaml)
-    proxies, runtime_providers = wait_for_runtime(base_url, secret, providers.keys())
+    proxies, runtime_providers = fetch_runtime(base_url, secret)
 
     # Mihomo's API omits server addresses, but its proxy/provider inventories are
     # authoritative for names after provider filters and name overrides.
@@ -618,14 +589,58 @@ def sync(
             for name, server in records
             if prefix + name + suffix in runtime_names
         )
-    if not servers:
-        raise RuntimeError("no proxy server endpoints found")
     endpoints = set(servers)
     for server in servers:
         try:
             ipaddress.ip_address(server)
         except ValueError:
             endpoints.update(resolved_addresses(base_url, secret, server))
+    return endpoints
+
+
+def rule_payload(endpoint: str) -> str:
+    """Payload that GET /rules reports for direct_rule(endpoint)."""
+    try:
+        address = ipaddress.ip_address(endpoint)
+    except ValueError:
+        return endpoint
+    return f"{address}/{address.max_prefixlen}"
+
+
+def direct_payloads(base_url: str, secret: str):
+    status, response = api_request(base_url, secret, "GET", "/rules")
+    if status != 200:
+        raise RuntimeError(f"/rules returned HTTP {status}")
+    rules = json.loads(response).get("rules")
+    if not isinstance(rules, list):
+        raise TypeError("invalid /rules response")
+    return {
+        rule.get("payload")
+        for rule in rules
+        if isinstance(rule, dict) and rule.get("proxy") == "DIRECT"
+    }
+
+
+def sync(
+    config_path: Path = DEFAULT_CONFIG,
+    base_url: str | None = None,
+    known=frozenset(),
+) -> tuple[set[str], bool]:
+    """Push known + active endpoints to Mihomo unless it already has them all.
+
+    Endpoints are only ever added, so a provider that breaks or a DNS answer
+    that rotates keeps its earlier endpoints until the watcher restarts.
+    """
+    yaml = config_path.read_text()
+    base_url = base_url or api_base_url(yaml)
+    secret = yaml_scalar(yaml, "secret")
+    endpoints = set(known) | active_endpoints(yaml, config_path, base_url, secret)
+    if not endpoints:
+        raise RuntimeError("no proxy server endpoints found")
+    if {rule_payload(endpoint) for endpoint in endpoints} <= direct_payloads(
+        base_url, secret
+    ):
+        return endpoints, False
     # Official Mihomo has no writable /rules route. PUT /configs is its supported
     # API for atomically applying a complete config with generated endpoint
     # rules and matching sniffer exclusions.
@@ -636,7 +651,27 @@ def sync(
     )
     if status != 204:
         raise RuntimeError(f"/configs returned HTTP {status}")
-    return len(proxies), len(endpoints)
+    return endpoints, True
+
+
+def watch(config_path: Path, base_url: str | None, interval: float) -> None:
+    """Re-check every interval; any failure is retried on the next tick."""
+    known: set[str] = set()
+    last_error = None
+    while True:
+        try:
+            known, applied = sync(config_path, base_url, known)
+            if applied:
+                print(
+                    f"clash proxy bypass: applied {len(known)} DIRECT endpoint rules",
+                    flush=True,
+                )
+            last_error = None
+        except Exception as error:  # noqa: BLE001 - the loop must survive any failure
+            if str(error) != last_error:
+                print(f"clash proxy bypass: {error}", file=sys.stderr, flush=True)
+            last_error = str(error)
+        time.sleep(interval)
 
 
 def self_test() -> None:
@@ -800,10 +835,13 @@ rules:
 
     requests = []
     runtime_providers = {}
+    runtime_rules = []
     original_api_request = globals()["api_request"]
 
     def fake_api_request(base_url, secret, method, path, body=None):
         requests.append((secret, method, path, body))
+        if path == "/rules":
+            return 200, json.dumps({"rules": runtime_rules}).encode()
         if path == "/proxies":
             return 200, b'{"proxies":{"one with spaces":{"type":"Vless"}}}'
         if path == "/providers/proxies":
@@ -829,7 +867,29 @@ rules:
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.yaml"
             config.write_text(yaml)
-            assert sync(config, "http://127.0.0.1:9090") == (1, 3)
+            first_endpoints = {"node.example.com", "198.51.100.7", "2001:db8::7"}
+            assert sync(config, "http://127.0.0.1:9090") == (first_endpoints, True)
+
+            # Mihomo already has every endpoint: nothing is pushed.
+            runtime_rules[:] = [
+                {"type": "Domain", "payload": "node.example.com", "proxy": "DIRECT"},
+                {"type": "IPCIDR", "payload": "198.51.100.7/32", "proxy": "DIRECT"},
+                {"type": "IPCIDR", "payload": "2001:db8::7/128", "proxy": "DIRECT"},
+                {"type": "Match", "payload": "", "proxy": "PROXY"},
+            ]
+            request_count = len(requests)
+            assert sync(config, "http://127.0.0.1:9090") == (first_endpoints, False)
+            assert all(method == "GET" for _, method, _, _ in requests[request_count:])
+
+            # Endpoints learned earlier stay even when no longer active.
+            endpoints, applied = sync(
+                config, "http://127.0.0.1:9090", known={"203.0.113.9"}
+            )
+            assert applied and endpoints == first_endpoints | {"203.0.113.9"}
+            assert (
+                "IP-CIDR,203.0.113.9/32,DIRECT,no-resolve" in requests[-1][3]["payload"]
+            )
+            runtime_rules.clear()
 
             provider = Path(directory) / "custom-provider.data"
             provider.write_text(
@@ -872,7 +932,10 @@ rules: null
             ) == {provider, remote}
             runtime_providers["active"] = {"proxies": [{"name": "kept with spaces"}]}
             request_count = len(requests)
-            assert sync(provider_config, "http://127.0.0.1:9090") == (1, 1)
+            assert sync(provider_config, "http://127.0.0.1:9090") == (
+                {"kept.example.com"},
+                True,
+            )
             provider_payload = next(
                 body["payload"]
                 for _, method, path, body in requests[request_count:]
@@ -883,26 +946,46 @@ rules: null
     finally:
         globals()["api_request"] = original_api_request
 
-    original_monotonic = time.monotonic
+    # watch(): a failing tick is logged once and retried on the next tick.
+    original_sync = globals()["sync"]
     original_sleep = time.sleep
-    original_api_request = globals()["api_request"]
-    clock = iter((0.0, 10.0))
+    outcomes = [
+        OSError("offline"),
+        OSError("offline"),
+        ({"192.0.2.4"}, True),
+        ({"192.0.2.4"}, False),
+    ]
+    seen_known = []
+
+    class StopWatch(BaseException):
+        pass
+
+    def fake_sync(config_path, base_url, known):
+        seen_known.append(set(known))
+        outcome = outcomes[len(seen_known) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    def fake_sleep(_):
+        if len(seen_known) == len(outcomes):
+            raise StopWatch
+
+    output = io.StringIO()
     try:
-        time.monotonic = lambda: next(clock)
-        time.sleep = lambda _: None
-        globals()["api_request"] = lambda *args, **kwargs: (_ for _ in ()).throw(
-            OSError("offline")
-        )
-        try:
-            wait_for_runtime("http://127.0.0.1:9090", "")
-        except RuntimeError as error:
-            assert str(error) == "offline"
-        else:
-            raise AssertionError("zero-wait API failure should raise RuntimeError")
+        globals()["sync"] = fake_sync
+        time.sleep = fake_sleep
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            try:
+                watch(DEFAULT_CONFIG, None, 30)
+            except StopWatch:
+                pass
     finally:
-        time.monotonic = original_monotonic
+        globals()["sync"] = original_sync
         time.sleep = original_sleep
-        globals()["api_request"] = original_api_request
+    assert output.getvalue().count("clash proxy bypass: offline") == 1
+    assert output.getvalue().count("applied 1 DIRECT endpoint rules") == 1
+    assert seen_known == [set(), set(), set(), {"192.0.2.4"}]
 
     assert requests[0][1:3] == ("GET", "/proxies")
     assert requests[1][1:3] == ("GET", "/providers/proxies")
@@ -932,20 +1015,19 @@ rules: null
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Add DIRECT rules for active Mihomo proxy endpoints"
+        description="Keep DIRECT rules for active Mihomo proxy endpoints"
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--api-url", help="override external-controller URL")
+    parser.add_argument(
+        "--interval", type=float, default=30, help="seconds between checks"
+    )
     parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
     if args.self_test:
         self_test()
         return
-    proxy_count, endpoint_count = sync(args.config, args.api_url)
-    print(
-        f"clash proxy bypass: loaded {proxy_count} API entries; "
-        f"applied {endpoint_count} DIRECT endpoint rules"
-    )
+    watch(args.config, args.api_url, args.interval)
 
 
 if __name__ == "__main__":

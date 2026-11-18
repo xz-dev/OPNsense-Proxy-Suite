@@ -15,6 +15,7 @@ procname="/usr/local/bin/clash"
 command="/usr/sbin/daemon"
 command_args="-f -p ${pidfile} -o ${logfile} ${procname} -d /usr/local/etc/clash/"
 proxy_bypass_script="/usr/local/etc/clash/scripts/mihomo_proxy_bypass.py"
+proxy_bypass_pidfile="/var/run/${name}_proxy_bypass.pid"
 
 start_precmd="${name}_prestart"
 start_postcmd="${name}_poststart"
@@ -30,16 +31,27 @@ clash_prestart()
     return 0
 }
 
+clash_proxy_bypass_stop()
+{
+    if [ -f "${proxy_bypass_pidfile}" ]; then
+        pkill -F "${proxy_bypass_pidfile}"
+        rm -f "${proxy_bypass_pidfile}"
+    fi
+}
+
 clash_poststart()
 {
+    # Re-checks proxy endpoints every 30s for as long as clash runs.
+    clash_proxy_bypass_stop
     if [ -x "${proxy_bypass_script}" ]; then
-        "${proxy_bypass_script}" >> "${logfile}" 2>&1 &
+        /usr/sbin/daemon -f -p "${proxy_bypass_pidfile}" -o "${logfile}" "${proxy_bypass_script}"
     fi
     return 0
 }
 
 clash_poststop()
 {
+    clash_proxy_bypass_stop
     [ -f "${pidfile}" ] && rm -f ${pidfile}
     echo "$(date '+%Y-%m-%d %H:%M:%S') - ${name} stopped." >> ${logfile}
     return 0
