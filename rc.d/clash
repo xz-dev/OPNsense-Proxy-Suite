@@ -8,64 +8,42 @@
 
 name="clash"
 rcvar=clash_enable
-log_file="/var/log/clash.log"
+pidfile="/var/run/${name}.pid"
+logfile="/var/log/${name}.log"
 
-command=/usr/sbin/daemon
-command_args="-P /var/run/clash.pid /usr/local/bin/clash -d /usr/local/etc/clash/ >>$log_file"
-proxy_bypass_script=/usr/local/etc/clash/scripts/mihomo_proxy_bypass.py
+procname="/usr/local/bin/clash"
+command="/usr/sbin/daemon"
+command_args="-f -p ${pidfile} -o ${logfile} ${procname} -d /usr/local/etc/clash/"
+proxy_bypass_script="/usr/local/etc/clash/scripts/mihomo_proxy_bypass.py"
 
-pidfile=/var/run/${name}.pid
+start_precmd="${name}_prestart"
+start_postcmd="${name}_poststart"
+stop_postcmd="${name}_poststop"
 
-start_postcmd=clash_proxy_bypass
-status_cmd=clash_status
+: ${clash_enable:="NO"}
 
-
-
-: ${clash_enable="NO"}
-
-log_message() {
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> $log_file
+clash_prestart()
+{
+    touch ${logfile}
+    chmod 644 ${logfile}
+    install -m 644 /dev/null ${pidfile}
+    return 0
 }
 
-clash_proxy_bypass()
+clash_poststart()
 {
-    if [ -x "$proxy_bypass_script" ]; then
-        "$proxy_bypass_script" >> "$log_file" 2>&1 &
+    if [ -x "${proxy_bypass_script}" ]; then
+        "${proxy_bypass_script}" >> "${logfile}" 2>&1 &
     fi
     return 0
 }
 
-clash_status()
+clash_poststop()
 {
-    if [ -n "$rc_pid" ]; then
-        log_message "${name} is running as pid $rc_pid."
-        echo "${name} is running as pid $rc_pid."
-        return 0
-    else
-        log_message "${name} is not running."
-        echo "${name} is not running."
-    fi
+    [ -f "${pidfile}" ] && rm -f ${pidfile}
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - ${name} stopped." >> ${logfile}
+    return 0
 }
 
-start_clash()
-{
-    log_message "Starting ${name}..."
-    $command $command_args >> $log_file 2>&1 &
-    echo $! > /var/run/clash.pid
-    log_message "${name} started with pid $(cat /var/run/clash.pid)."
-}
-
-stop_clash()
-{
-    log_message "Stopping ${name}..."
-    if [ -f /var/run/clash.pid ]; then
-        kill $(cat /var/run/clash.pid)
-        rm -f /var/run/clash.pid
-        log_message "${name} stopped."
-    else
-        log_message "No ${name} pid file found."
-    fi
-}
-
-load_rc_config clash
-run_rc_command $1
+load_rc_config $name
+run_rc_command "$@"
